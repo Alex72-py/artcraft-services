@@ -1,0 +1,17 @@
+name: PR Backend Validation
+
+on:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check backend and tests
+        run: cargo check -p storyteller-web --tests
+      - name: Run targeted tests
+        run: cargo test -p storyteller-web resolve_mesh_file_metadata
