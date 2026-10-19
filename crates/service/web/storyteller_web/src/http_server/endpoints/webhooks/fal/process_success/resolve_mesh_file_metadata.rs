@@ -12,6 +12,10 @@ use zip::ZipArchive;
 use super::resolve_file_metadata::{resolve_file_metadata_with_file_name, MetadataSource};
 
 const MAX_OBJ_PACKAGE_ENTRIES: usize = 1024;
+// Limit on the sizes *declared* in the ZIP entry headers, i.e. what the package
+// claims, not what a reader would unpack. Nothing here extracts or decompresses
+// the archive, so this is enough for now. Any later change that unpacks the
+// package must enforce its own limit on the bytes it actually reads.
 const MAX_OBJ_PACKAGE_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 pub(super) struct ResolvedMeshFileMetadata {
@@ -70,6 +74,7 @@ fn is_supported_obj_package(file_bytes: &[u8]) -> bool {
     if file.is_dir() {
       continue;
     }
+    // `size()` is the uncompressed size declared in the header, not a measured one.
     let Some(size) = total_size.checked_add(file.size()) else {
       return false;
     };
