@@ -1,6 +1,7 @@
 name: PR Backend Validation
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - fix/fal-obj-zip-mime
