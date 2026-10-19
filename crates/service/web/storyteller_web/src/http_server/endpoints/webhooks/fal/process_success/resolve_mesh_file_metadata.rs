@@ -1,6 +1,7 @@
 //! Mesh-only classification for Fal results. ZIP is a container, not a global
-//! alias for OBJ: only an archive containing an OBJ and supported companion
-//! files is accepted here. Preserve its ZIP MIME type and extension on storage.
+//! alias for OBJ. ZIP results are rejected for now: the mesh readers cannot
+//! unpack packages, so classifying one as `MediaFileType::Obj` would hand ZIP
+//! bytes to readers that expect raw OBJ text.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -32,10 +33,9 @@ pub(super) fn resolve_mesh_file_metadata(file_bytes: &[u8], fal_content_type: Op
   let is_zip = MimetypeInfo::get_for_bytes(file_bytes).map(|info| info.mime_type() == "application/zip").unwrap_or(false);
 
   if is_zip {
-    if !is_supported_obj_package(file_bytes) {
-      return None;
-    }
-    return Some(ResolvedMeshFileMetadata { mime_type: "application/zip".to_string(), extension_with_period: ".zip", media_file_type: MediaFileType::Obj, source: MetadataSource::MagicBytes });
+    // Keep ZIP packages rejected until the mesh readers can extract them.
+    // `is_supported_obj_package` is retained for that follow-up.
+    return None;
   }
 
   // Unrelated formats keep exactly the existing resolution and mapping.
@@ -47,6 +47,7 @@ pub(super) fn resolve_mesh_file_metadata(file_bytes: &[u8], fal_content_type: Op
 /// Check package structure without extracting or decompressing untrusted files.
 /// Support a single nonempty OBJ plus optional MTLs and texture images, not
 /// arbitrary archives, multi-model bundles, or other mesh/project formats.
+#[allow(dead_code)] // Not wired in until readers support ZIP packages.
 fn is_supported_obj_package(file_bytes: &[u8]) -> bool {
   let Ok(mut archive) = ZipArchive::new(Cursor::new(file_bytes)) else {
     return false;
@@ -107,27 +108,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn application_zip_obj_package_keeps_container_metadata() {
+    fn obj_package_is_structurally_supported_but_still_rejected() {
       let bytes = package(&[("model/model.OBJ", OBJ), ("model/material.mtl", b"newmtl material"), ("model/texture.png", b"texture")]);
-      let metadata = resolve_mesh_file_metadata(&bytes, Some("application/zip"), Some("model.zip")).unwrap();
-      assert_eq!(metadata.media_file_type, MediaFileType::Obj);
-      assert_eq!(metadata.mime_type, "application/zip");
-      assert_eq!(metadata.extension_with_period, ".zip");
-      assert_eq!(metadata.source, MetadataSource::MagicBytes);
+      assert!(is_supported_obj_package(&bytes));
+      assert!(resolve_mesh_file_metadata(&bytes, Some("application/zip"), Some("model.zip")).is_none());
     }
 
     #[test]
-    fn obj_package_detected_without_webhook_hints() {
+    fn obj_package_rejected_without_webhook_hints() {
       let bytes = package(&[("model.obj", OBJ)]);
-      assert_eq!(resolve_mesh_file_metadata(&bytes, None, None).unwrap().media_file_type, MediaFileType::Obj);
+      assert!(resolve_mesh_file_metadata(&bytes, None, None).is_none());
     }
 
     #[test]
     fn archive_magic_wins_over_obj_hints() {
       let bytes = package(&[("model.obj", OBJ)]);
-      let metadata = resolve_mesh_file_metadata(&bytes, Some("model/obj"), Some("model.obj")).unwrap();
-      assert_eq!(metadata.mime_type, "application/zip");
-      assert_eq!(metadata.extension_with_period, ".zip");
+      assert!(resolve_mesh_file_metadata(&bytes, Some("model/obj"), Some("model.obj")).is_none());
     }
   }
 
