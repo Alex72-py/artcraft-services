@@ -270,3 +270,155 @@ async fn try_to_attach_preprocessed_image(
     server_state,
   }).await
 }
+
+
+// This test exercises the complete download -> ZIP extraction -> bucket write ->
+// media_files row path. It uses the guarded test database and the existing
+// in-process stub bucket from TestHarness; no real provider or storage is called.
+#[cfg(all(test, not(feature = "skip_database_tests")))]
+mod uploader_integration_tests {
+  use std::io::{Cursor, Read, Write};
+  use std::marker::PhantomData;
+  use std::net::TcpListener;
+  use std::sync::atomic::{AtomicU64, Ordering};
+  use std::thread;
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  use bucket_paths::legacy::typified_paths::public::media_files::bucket_file_path::MediaFileBucketPath;
+  use enums::by_table::media_files::media_file_class::MediaFileClass;
+  use enums::by_table::media_files::media_file_type::MediaFileType;
+  use enums::common::visibility::Visibility;
+  use hashing::sha256::sha256_hash_bytes::sha256_hash_bytes;
+  use mysql_queries::queries::generic_inference::api_providers::fal::get_inference_job_by_fal_id::get_inference_job_by_fal_id;
+  use mysql_queries::queries::generic_inference::api_providers::fal::insert_generic_inference_job_for_fal_queue::{
+    insert_generic_inference_job_for_fal_queue, FalCategory, InsertGenericInferenceForFalArgs,
+  };
+  use mysql_queries::queries::media_files::get::get_media_file::get_media_file;
+  use tokens::tokens::generic_inference_jobs::InferenceJobToken;
+  use zip::write::FileOptions;
+  use zip::ZipWriter;
+
+  use super::{upload_mesh_file, UploadMeshFileArgs};
+  use crate::http_server::endpoints::omni_gen::generate::video::tests::support::TestHarness;
+
+  const OBJ_BYTES: &[u8] = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+
+  #[tokio::test]
+  async fn zip_obj_upload_stores_raw_obj_and_consistent_metadata() {
+    let harness = TestHarness::create().await;
+
+    // Insert a real Fal job so the uploaded media row uses a valid source job.
+    let generated_job_token = InferenceJobToken::generate();
+    let external_job_id = format!("mesh-upload-e2e-{}", generated_job_token.as_str());
+    let now = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .expect("system clock")
+      .as_nanos() as u64;
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let idempotency_token = format!("{:016x}{:016x}", now, NEXT_ID.fetch_add(1, Ordering::Relaxed));
+
+    let mut connection = harness.pool.acquire().await.expect("acquire test database connection");
+    insert_generic_inference_job_for_fal_queue(InsertGenericInferenceForFalArgs {
+      uuid_idempotency_token: &idempotency_token,
+      maybe_external_third_party_id: &external_job_id,
+      fal_category: FalCategory::ObjectGeneration,
+      maybe_model_type: None,
+      maybe_inference_args: None,
+      maybe_prompt_token: None,
+      maybe_creator_user_token: None,
+      maybe_avt_token: None,
+      creator_ip_address: "127.0.0.1",
+      creator_set_visibility: Visibility::Public,
+      maybe_platform_type: None,
+      mysql_executor: &mut *connection,
+      phantom: PhantomData,
+    })
+    .await
+    .expect("insert test Fal job");
+    drop(connection);
+
+    let job = get_inference_job_by_fal_id(&external_job_id, &harness.pool)
+      .await
+      .expect("read test Fal job")
+      .expect("test Fal job exists");
+
+    let zip_bytes = make_obj_package();
+    let source_url = serve_bytes_once(zip_bytes.clone());
+
+    // Deliberately supply misleading non-ZIP hints: ZIP magic must win.
+    let media_token = upload_mesh_file(UploadMeshFileArgs {
+      mesh_url: &source_url,
+      maybe_content_type: Some("model/obj"),
+      maybe_file_name: Some("model.obj"),
+      maybe_batch_token: None,
+      job: &job,
+      server_state: &harness.server_state,
+    })
+    .await
+    .unwrap_or_else(|err| panic!("mesh upload failed: {:?}", err));
+
+    let media = get_media_file(&media_token, true, &harness.pool)
+      .await
+      .expect("query uploaded media row")
+      .expect("uploaded media row exists");
+
+    assert_eq!(media.media_type, MediaFileType::Obj);
+    assert_eq!(media.media_class, MediaFileClass::Mesh);
+    assert_eq!(media.maybe_mime_type.as_deref(), Some("model/obj"));
+    assert_eq!(media.maybe_public_bucket_extension.as_deref(), Some(".obj"));
+
+    let (file_size_bytes, checksum_sha2): (u64, String) =
+      sqlx::query_as("SELECT file_size_bytes, checksum_sha2 FROM media_files WHERE token = ?")
+        .bind(media_token.as_str())
+        .fetch_one(&harness.pool)
+        .await
+        .expect("read stored size and checksum");
+
+    assert_eq!(file_size_bytes, OBJ_BYTES.len() as u64);
+    assert_eq!(checksum_sha2, sha256_hash_bytes(OBJ_BYTES).expect("hash OBJ bytes"));
+
+    // Read the uploaded object back through the actual LegacyBucketClient.
+    let object_path = MediaFileBucketPath::from_object_hash(
+      &media.public_bucket_directory_hash,
+      media.maybe_public_bucket_prefix.as_deref(),
+      media.maybe_public_bucket_extension.as_deref(),
+    );
+    let stored_bytes = harness
+      .server_state
+      .public_bucket_client
+      .download_file(object_path.get_full_object_path_str())
+      .await
+      .expect("download uploaded mesh from the test bucket");
+
+    assert_eq!(stored_bytes, OBJ_BYTES, "bucket must contain raw OBJ, not ZIP bytes");
+    assert_ne!(stored_bytes, zip_bytes);
+  }
+
+  fn make_obj_package() -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+      .start_file("model.obj", FileOptions::default())
+      .expect("start OBJ entry");
+    writer.write_all(OBJ_BYTES).expect("write OBJ entry");
+    writer.finish().expect("finish ZIP package").into_inner()
+  }
+
+  fn serve_bytes_once(body: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test HTTP server");
+    let address = listener.local_addr().expect("local test HTTP server address");
+
+    thread::spawn(move || {
+      let (mut stream, _) = listener.accept().expect("accept mesh download");
+      let mut request = [0_u8; 2048];
+      let _ = stream.read(&mut request);
+      let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+      );
+      stream.write_all(headers.as_bytes()).expect("write HTTP headers");
+      stream.write_all(&body).expect("write ZIP response body");
+    });
+
+    format!("http://{address}/model.zip")
+  }
+}
