@@ -4,6 +4,7 @@ use crate::http_server::endpoints::webhooks::fal::process_success::attach_prompt
 use crate::http_server::endpoints::webhooks::fal::process_success::resolve_mesh_file_metadata::resolve_mesh_file_metadata;
 use crate::state::server_state::ServerState;
 use crate::util::http_download_url_to_bytes::http_download_url_to_bytes;
+use bytes::Bytes;
 use bucket_paths::legacy::typified_paths::public::media_files::bucket_file_path::MediaFileBucketPath;
 use enums::by_table::media_files::media_file_class::MediaFileClass;
 use enums::by_table::media_files::media_file_engine_category::MediaFileEngineCategory;
@@ -147,9 +148,9 @@ pub(crate) async fn upload_mesh_file(
         })?;
   }
 
-  // Resolve mesh metadata, including validated OBJ ZIP packages. Other files
-  // retain the magic bytes / fal content_type / file name fallback order.
-  let metadata = resolve_mesh_file_metadata(&file_bytes, maybe_content_type, maybe_file_name)
+  // Resolve mesh metadata. A validated OBJ ZIP package is unpacked to its OBJ.
+  // Other files retain the magic bytes / fal content_type / file name order.
+  let mut metadata = resolve_mesh_file_metadata(&file_bytes, maybe_content_type, maybe_file_name)
       .ok_or_else(|| {
         warn!(
           "Could not determine file type for mesh (bytes: {}, fal content_type: {:?}, file_name: {:?})",
@@ -161,6 +162,13 @@ pub(crate) async fn upload_mesh_file(
           &format!("Could not determine file type for mesh (bytes: {}, fal content_type: {:?})",
             file_bytes.len(), maybe_content_type))
       })?;
+
+  // For a ZIP package, store the extracted raw OBJ (size, hash, and upload
+  // below all use these bytes) rather than the downloaded archive.
+  let file_bytes = match metadata.replacement_file_bytes.take() {
+    Some(extracted) => Bytes::from(extracted),
+    None => file_bytes,
+  };
 
   let mime_type = metadata.mime_type.as_str();
 
