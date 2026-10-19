@@ -1,9 +1,9 @@
 //! Mesh-only classification for Fal results. ZIP is a container, not a global
-//! alias for OBJ. ZIP results are rejected for now: the mesh readers cannot
-//! unpack packages, so classifying one as `MediaFileType::Obj` would hand ZIP
-//! bytes to readers that expect raw OBJ text.
+//! alias for OBJ. Fal can return an OBJ model wrapped in a ZIP package. The
+//! package is validated and the single OBJ inside is extracted, so what gets
+//! stored is a genuine raw OBJ that every existing mesh reader already handles.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 use enums::by_table::media_files::media_file_type::MediaFileType;
@@ -14,16 +14,19 @@ use super::resolve_file_metadata::{resolve_file_metadata_with_file_name, Metadat
 
 const MAX_OBJ_PACKAGE_ENTRIES: usize = 1024;
 // Limit on the sizes *declared* in the ZIP entry headers, i.e. what the package
-// claims, not what a reader would unpack. Nothing here extracts or decompresses
-// the archive, so this is enough for now. Any later change that unpacks the
-// package must enforce its own limit on the bytes it actually reads.
+// claims. Declared sizes are untrusted, so extraction enforces its own limit.
 const MAX_OBJ_PACKAGE_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+// Hard limit on the bytes actually read when extracting the OBJ.
+const MAX_EXTRACTED_OBJ_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) struct ResolvedMeshFileMetadata {
   pub mime_type: String,
   pub extension_with_period: &'static str,
   pub media_file_type: MediaFileType,
   pub source: MetadataSource,
+  /// Set when the downloaded bytes were a ZIP package: the OBJ extracted from
+  /// it. The caller must hash and store these bytes instead of the download.
+  pub replacement_file_bytes: Option<Vec<u8>>,
 }
 
 pub(super) fn resolve_mesh_file_metadata(file_bytes: &[u8], fal_content_type: Option<&str>, maybe_file_name: Option<&str>) -> Option<ResolvedMeshFileMetadata> {
@@ -33,64 +36,84 @@ pub(super) fn resolve_mesh_file_metadata(file_bytes: &[u8], fal_content_type: Op
   let is_zip = MimetypeInfo::get_for_bytes(file_bytes).map(|info| info.mime_type() == "application/zip").unwrap_or(false);
 
   if is_zip {
-    // Keep ZIP packages rejected until the mesh readers can extract them.
-    // `is_supported_obj_package` is retained for that follow-up.
+    // Unpack the single OBJ and classify it like any other OBJ. The extracted
+    // bytes must resolve to an OBJ (never to a nested archive or other format).
+    let obj_bytes = extract_obj_from_package(file_bytes)?;
+    // OBJ is plain text with no magic bytes. Anything recognizable as another
+    // format (a nested archive, an image, ...) is not an OBJ, whatever its name.
+    if MimetypeInfo::get_for_bytes(&obj_bytes).is_some() {
+      return None;
+    }
+    let mut resolved = resolve_non_zip(&obj_bytes, Some("model/obj"), Some("model.obj"))?;
+    if resolved.media_file_type != MediaFileType::Obj {
+      return None;
+    }
+    resolved.replacement_file_bytes = Some(obj_bytes);
+    return Some(resolved);
+  }
+
+  resolve_non_zip(file_bytes, fal_content_type, maybe_file_name)
+}
+
+// Unrelated formats keep exactly the existing resolution and mapping.
+fn resolve_non_zip(file_bytes: &[u8], fal_content_type: Option<&str>, maybe_file_name: Option<&str>) -> Option<ResolvedMeshFileMetadata> {
+  let metadata = resolve_file_metadata_with_file_name(file_bytes, fal_content_type, maybe_file_name)?;
+  let media_file_type = MediaFileType::try_from_mime_type(&metadata.mime_type)?;
+  Some(ResolvedMeshFileMetadata { mime_type: metadata.mime_type, extension_with_period: metadata.file_extension.extension_with_period(), media_file_type, source: metadata.source, replacement_file_bytes: None })
+}
+
+/// Validate a package and extract its OBJ.
+/// Supports a single nonempty OBJ plus optional MTLs and texture images, not
+/// arbitrary archives, multi-model bundles, or other mesh/project formats.
+/// Only the OBJ entry is read; other entries are checked but never unpacked.
+fn extract_obj_from_package(file_bytes: &[u8]) -> Option<Vec<u8>> {
+  extract_obj_from_package_with_limit(file_bytes, MAX_EXTRACTED_OBJ_BYTES)
+}
+
+fn extract_obj_from_package_with_limit(file_bytes: &[u8], max_extracted_bytes: u64) -> Option<Vec<u8>> {
+  let mut archive = ZipArchive::new(Cursor::new(file_bytes)).ok()?;
+  if archive.len() > MAX_OBJ_PACKAGE_ENTRIES {
     return None;
   }
 
-  // Unrelated formats keep exactly the existing resolution and mapping.
-  let metadata = resolve_file_metadata_with_file_name(file_bytes, fal_content_type, maybe_file_name)?;
-  let media_file_type = MediaFileType::try_from_mime_type(&metadata.mime_type)?;
-  Some(ResolvedMeshFileMetadata { mime_type: metadata.mime_type, extension_with_period: metadata.file_extension.extension_with_period(), media_file_type, source: metadata.source })
-}
-
-/// Check package structure without extracting or decompressing untrusted files.
-/// Support a single nonempty OBJ plus optional MTLs and texture images, not
-/// arbitrary archives, multi-model bundles, or other mesh/project formats.
-#[allow(dead_code)] // Not wired in until readers support ZIP packages.
-fn is_supported_obj_package(file_bytes: &[u8]) -> bool {
-  let Ok(mut archive) = ZipArchive::new(Cursor::new(file_bytes)) else {
-    return false;
-  };
-  if archive.len() > MAX_OBJ_PACKAGE_ENTRIES {
-    return false;
-  }
-
-  let mut obj_count = 0;
+  let mut obj_index = None;
   let mut total_size = 0u64;
   for index in 0..archive.len() {
-    let Ok(file) = archive.by_index(index) else {
-      return false;
-    };
+    let file = archive.by_index(index).ok()?;
     if file.enclosed_name().is_none() || file.name().contains('\\') {
-      return false;
+      return None;
     }
     // Only directories and regular files, never symlinks or special files.
     if let Some(mode) = file.unix_mode() {
       let kind = mode & 0o170000;
       if kind != 0 && kind != 0o100000 && kind != 0o040000 {
-        return false;
+        return None;
       }
     }
     if file.is_dir() {
       continue;
     }
     // `size()` is the uncompressed size declared in the header, not a measured one.
-    let Some(size) = total_size.checked_add(file.size()) else {
-      return false;
-    };
-    total_size = size;
+    total_size = total_size.checked_add(file.size())?;
     if total_size > MAX_OBJ_PACKAGE_UNCOMPRESSED_BYTES {
-      return false;
+      return None;
     }
     let extension = Path::new(file.name()).extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase();
     match extension.as_str() {
-      "obj" if file.size() > 0 => obj_count += 1,
+      "obj" if file.size() > 0 && obj_index.is_none() => obj_index = Some(index),
       "mtl" | "png" | "jpg" | "jpeg" | "webp" => {},
-      _ => return false,
+      _ => return None,
     }
   }
-  obj_count == 1
+
+  // The declared size is untrusted, so bound the bytes actually read.
+  let mut obj_file = archive.by_index(obj_index?).ok()?;
+  let mut obj_bytes = Vec::new();
+  Read::take(&mut obj_file, max_extracted_bytes + 1).read_to_end(&mut obj_bytes).ok()?;
+  if obj_bytes.is_empty() || obj_bytes.len() as u64 > max_extracted_bytes {
+    return None;
+  }
+  Some(obj_bytes)
 }
 
 #[cfg(test)]
@@ -108,22 +131,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn obj_package_is_structurally_supported_but_still_rejected() {
+    fn obj_package_is_extracted_to_raw_obj() {
       let bytes = package(&[("model/model.OBJ", OBJ), ("model/material.mtl", b"newmtl material"), ("model/texture.png", b"texture")]);
-      assert!(is_supported_obj_package(&bytes));
-      assert!(resolve_mesh_file_metadata(&bytes, Some("application/zip"), Some("model.zip")).is_none());
+      let metadata = resolve_mesh_file_metadata(&bytes, Some("application/zip"), Some("model.zip")).unwrap();
+      assert_eq!(metadata.media_file_type, MediaFileType::Obj);
+      assert_eq!(metadata.mime_type, "model/obj");
+      assert_eq!(metadata.extension_with_period, ".obj");
+      assert_eq!(metadata.replacement_file_bytes.as_deref(), Some(OBJ));
     }
 
     #[test]
-    fn obj_package_rejected_without_webhook_hints() {
+    fn obj_package_extracted_without_or_with_misleading_hints() {
       let bytes = package(&[("model.obj", OBJ)]);
-      assert!(resolve_mesh_file_metadata(&bytes, None, None).is_none());
+      for (content_type, file_name) in [(None, None), (Some("model/obj"), Some("model.obj")), (Some("application/octet-stream"), None)] {
+        let metadata = resolve_mesh_file_metadata(&bytes, content_type, file_name).unwrap();
+        assert_eq!(metadata.media_file_type, MediaFileType::Obj);
+        assert_eq!(metadata.replacement_file_bytes.as_deref(), Some(OBJ));
+      }
     }
 
     #[test]
-    fn archive_magic_wins_over_obj_hints() {
+    fn extraction_is_bounded_by_bytes_actually_read() {
       let bytes = package(&[("model.obj", OBJ)]);
-      assert!(resolve_mesh_file_metadata(&bytes, Some("model/obj"), Some("model.obj")).is_none());
+      assert!(extract_obj_from_package_with_limit(&bytes, OBJ.len() as u64).is_some());
+      assert!(extract_obj_from_package_with_limit(&bytes, OBJ.len() as u64 - 1).is_none());
+    }
+
+    #[test]
+    fn nested_archive_inside_obj_entry_rejected() {
+      let inner = package(&[("model.obj", OBJ)]);
+      let bytes = package(&[("model.obj", &inner)]);
+      assert!(resolve_mesh_file_metadata(&bytes, Some("application/zip"), None).is_none());
     }
   }
 
