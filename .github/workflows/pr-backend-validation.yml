@@ -13,6 +13,19 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
     timeout-minutes: 45
     env:
       SQLX_OFFLINE: "true"
@@ -34,3 +47,8 @@ jobs:
         run: cargo check -p storyteller-web --tests
       - name: Run resolver tests without database fixtures
         run: cargo test -p storyteller-web --features skip_database_tests resolve_mesh_file_metadata
+
+      - name: Run mesh uploader integration test with MySQL
+        env:
+          ARTCRAFT_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/artcraft_test
+        run: cargo test -p storyteller-web --bin storyteller-web zip_obj_upload_stores_raw_obj_and_consistent_metadata
