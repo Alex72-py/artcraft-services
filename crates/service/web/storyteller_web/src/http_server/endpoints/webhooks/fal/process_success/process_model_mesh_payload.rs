@@ -367,14 +367,14 @@ mod uploader_integration_tests {
     assert_eq!(media.maybe_mime_type.as_deref(), Some("model/obj"));
     assert_eq!(media.maybe_public_bucket_extension.as_deref(), Some(".obj"));
 
-    let (file_size_bytes, checksum_sha2): (u64, String) =
+    let (file_size_bytes, checksum_sha2): (i32, String) =
       sqlx::query_as("SELECT file_size_bytes, checksum_sha2 FROM media_files WHERE token = ?")
         .bind(media_token.as_str())
         .fetch_one(&harness.pool)
         .await
         .expect("read stored size and checksum");
 
-    assert_eq!(file_size_bytes, OBJ_BYTES.len() as u64);
+    assert_eq!(file_size_bytes, OBJ_BYTES.len() as i32);
     assert_eq!(checksum_sha2, sha256_hash_bytes(OBJ_BYTES).expect("hash OBJ bytes"));
 
     // Read the uploaded object back through the actual LegacyBucketClient.
