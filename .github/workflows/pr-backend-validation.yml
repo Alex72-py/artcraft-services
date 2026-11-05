@@ -124,7 +124,8 @@ jobs:
           rustfmt --edition 2018 --config-path rustfmt.toml --check \
             crates/service/web/storyteller_web/src/http_server/endpoints/webhooks/fal/process_success/download_mesh_file.rs \
             crates/service/web/storyteller_web/src/http_server/endpoints/webhooks/fal/process_success/resolve_mesh_file_metadata.rs \
-            crates/schema/database/mysql_queries/src/queries/media_files/get/get_media_file_storage_metadata.rs
+            crates/schema/database/mysql_queries/src/queries/media_files/get/get_media_file_storage_metadata.rs \
+            crates/service/web/storyteller_web/src/http_server/endpoints/webhooks/fal/process_success/process_model_mesh_payload.rs
       - name: Confirm validation did not modify source
         if: inputs.mode == 'validate'
         run: git diff --exit-code
