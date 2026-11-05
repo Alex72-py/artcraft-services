@@ -2,9 +2,20 @@ name: Fork-only validation for PR 155
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - ci/validate-pr-155
+    inputs:
+      source_ref:
+        description: Existing PR commit or branch to check out
+        required: true
+        default: fix/fal-obj-zip-mime
+        type: string
+      mode:
+        description: Prepare genuine SQLx metadata or validate the checked-out head
+        required: true
+        default: validate
+        type: choice
+        options:
+          - validate
+          - prepare-sqlx
 
 permissions:
   contents: read
@@ -29,25 +40,90 @@ jobs:
     env:
       SQLX_OFFLINE: "true"
       CARGO_TERM_COLOR: always
+      ARTCRAFT_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/artcraft_test
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ inputs.source_ref }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # pinned commit
+      - name: Record exact source head
+        run: |
+          echo "PR155_CHECKED_OUT_SHA=$(git rev-parse HEAD)"
+          git status --short
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
           toolchain: 1.93.0
+          components: rustfmt, clippy
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential cmake curl ffmpeg fontconfig git libclang-dev \
+            build-essential cmake clang curl ffmpeg fontconfig git libclang-dev \
             libfontconfig1-dev libssl-dev musl-tools perl pkg-config
-      - name: Check backend and test targets
-        run: cargo check -p storyteller-web --tests
-      - name: Run resolver tests without database fixtures
-        run: cargo test -p storyteller-web --features skip_database_tests resolve_mesh_file_metadata
-
-      - name: Run mesh uploader integration test with MySQL
+      - name: Generate genuine SQLx metadata against isolated MySQL
+        if: inputs.mode == 'prepare-sqlx'
         env:
-          ARTCRAFT_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/artcraft_test
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+        run: |
+          set -euo pipefail
+          docker exec "$MYSQL_CONTAINER" mysql -uroot -proot -e 'CREATE DATABASE artcraft_sqlx_test'
+          docker exec -i "$MYSQL_CONTAINER" mysql -uroot -proot artcraft_sqlx_test < _database/sql/migrations_squashed/media_files.sql
+          probe="$(mktemp -d)"
+          mkdir -p "$probe/src" "$probe/.sqlx"
+          cat > "$probe/Cargo.toml" <<'TOML'
+          [package]
+          name = "pr155-sqlx-metadata"
+          version = "0.0.0"
+          edition = "2021"
+          [dependencies]
+          sqlx = { version = "=0.7.4", default-features = false, features = ["mysql", "macros", "runtime-tokio-rustls"] }
+          TOML
+          cat > "$probe/src/lib.rs" <<'RUST'
+          pub async fn describe(pool: &sqlx::MySqlPool, token: &str) -> Result<(), sqlx::Error> {
+            let row = sqlx::query!("SELECT file_size_bytes, checksum_sha2 FROM media_files WHERE token = ?", token)
+              .fetch_one(pool).await?;
+            let _: i32 = row.file_size_bytes;
+            let _: String = row.checksum_sha2;
+            Ok(())
+          }
+          RUST
+          SQLX_OFFLINE=false \
+            DATABASE_URL=mysql://root:root@127.0.0.1:3306/artcraft_sqlx_test \
+            SQLX_OFFLINE_DIR="$probe/.sqlx" \
+            cargo check --manifest-path "$probe/Cargo.toml"
+          python3 - "$probe/.sqlx" <<'PY'
+          import base64, json, pathlib, sys
+          files = list(pathlib.Path(sys.argv[1]).glob('query-*.json'))
+          assert len(files) == 1, files
+          data = json.loads(files[0].read_text())
+          assert data['query'] == 'SELECT file_size_bytes, checksum_sha2 FROM media_files WHERE token = ?'
+          print('PR155_SQLX_FILE=' + files[0].name)
+          print('PR155_SQLX_BEGIN')
+          print(base64.b64encode(files[0].read_bytes()).decode())
+          print('PR155_SQLX_END')
+          PY
+      - name: Check backend and test targets offline
+        if: inputs.mode == 'validate'
+        run: cargo check -p storyteller-web --tests
+      - name: Check query crate offline
+        if: inputs.mode == 'validate'
+        run: cargo check -p mysql_queries
+      - name: Run resolver tests without database fixtures
+        if: inputs.mode == 'validate'
+        run: cargo test -p storyteller-web --features skip_database_tests resolve_mesh_file_metadata
+      - name: Run bounded mesh download regression tests
+        if: inputs.mode == 'validate'
+        run: cargo test -p storyteller-web --features skip_database_tests download_mesh_file
+      - name: Run mesh uploader integration test with MySQL
+        if: inputs.mode == 'validate'
         run: cargo test -p storyteller-web --bin storyteller-web zip_obj_upload_stores_raw_obj_and_consistent_metadata
+      - name: Check formatting of new and resolver source files
+        if: inputs.mode == 'validate'
+        run: |
+          rustfmt --edition 2018 --config-path rustfmt.toml --check \
+            crates/service/web/storyteller_web/src/http_server/endpoints/webhooks/fal/process_success/download_mesh_file.rs \
+            crates/service/web/storyteller_web/src/http_server/endpoints/webhooks/fal/process_success/resolve_mesh_file_metadata.rs \
+            crates/schema/database/mysql_queries/src/queries/media_files/get/get_media_file_storage_metadata.rs
+      - name: Confirm validation did not modify source
+        if: inputs.mode == 'validate'
+        run: git diff --exit-code
